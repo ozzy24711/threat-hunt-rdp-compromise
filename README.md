@@ -35,6 +35,8 @@ let HostInQuestion = "npt-ws01";
 DeviceLogonEvents
 | where TimeGenerated between (start_time .. end_time)
 | where DeviceName == HostInQuestion
+| where ActionType == "LogonSuccess"
+| project Timestamp, AccountName, LogonType, RemoteIP, ActionType
 ```
 
 **3. Finding the executed command**
@@ -53,7 +55,7 @@ DeviceProcessEvents
 **4. Tracing the parent process**
 Pivoted on that `cmd.exe` event and read `InitiatingProcessFileName`. The parent was the WMI provider host process, confirming the command was launched remotely via WMI rather than by a local user at the keyboard.
 
-Same query as Step 3, with `InitiatingProcessFileName` added to the projection to identify the parent process.
+Same as Step 3, with `InitiatingProcessFileName` added to the projection.
 
 **5. Finding command-and-control traffic**
 Queried `DeviceNetworkEvents` filtered to the compromised account, projecting the remote URL and initiating process. Found outbound traffic to a domain with no legitimate business purpose, from a non-Microsoft-signed process — consistent with C2 beaconing.
@@ -69,8 +71,10 @@ DeviceNetworkEvents
 | project InitiatingProcessAccountDomain, InitiatingProcessFileName, RemoteUrl, ActionType
 ```
 
+Results were manually reviewed to exclude Microsoft-signed processes and known-legitimate domains (e.g. `*.microsoft.com`, `*.windows.com`).
+
 **6. Finding the dropped file**
-Queried `DeviceFileEvents` for the host and time window. Initial results were too noisy; I added a filter for non-empty SHA256 values to cut the result set down, then reviewed what remained for anything created in Temp under a name masquerading as a legitimate Windows process.
+Queried `DeviceFileEvents` for the host and time window. Initial results were too noisy; I added filters for non-empty SHA256 values and a Temp folder path to cut the result set down, then reviewed what remained for anything under a name masquerading as a legitimate Windows process.
 
 ```kql
 let start_time = datetime(2026-04-21T00:00:00.00Z);
@@ -80,8 +84,11 @@ DeviceFileEvents
 | where TimeGenerated between (start_time .. end_time)
 | where DeviceName == HostInQuestion
 | where isnotempty(SHA256)
-| project InitiatingProcessAccountDomain, InitiatingProcessFileName, SHA256, ActionType
+| where FolderPath contains "Temp"
+| project InitiatingProcessAccountDomain, InitiatingProcessFileName, FolderPath, SHA256, ActionType
 ```
+
+> **Time window note:** Steps 1–6 searched a two-day window to establish the timeline. Once the malicious activity was located, Steps 7–10 were narrowed to the ~6-hour overnight window (2026-04-22 02:00–08:00 UTC) where it occurred, to reduce noise.
 
 **7. Finding registry persistence**
 Queried `DeviceRegistryEvents` filtered to Run-key writes. Found a Run-key value disguised as a legitimate update/health-check entry, pointing back at the dropped file in Temp.
@@ -108,7 +115,7 @@ let HostInQuestion = "npt-ws01";
 DeviceProcessEvents
 | where TimeGenerated between (start_time .. end_time)
 | where DeviceName == HostInQuestion
-| where ProcessCommandLine contains "tn"
+| where ProcessCommandLine contains "schtasks" and ProcessCommandLine contains "/create"
 | project Timestamp, ActionType, FileName, ProcessCommandLine
 ```
 
@@ -127,7 +134,7 @@ DeviceProcessEvents
 ```
 
 **10. Finding the backdoor account**
-Queried `DeviceProcessEvents` for `net user` commands. Found a new local account created and, in a correlated event seconds later, added to the local Administrators group — privilege escalation via a backdoor account.
+Queried `DeviceProcessEvents` for `net user` and `net localgroup` commands. Found a new local account created and, in a correlated event seconds later, added to the local Administrators group — privilege escalation via a backdoor account.
 
 ```kql
 let start_time = datetime(2026-04-22T02:00:00.00Z);
@@ -136,7 +143,7 @@ let HostInQuestion = "npt-ws01";
 DeviceProcessEvents
 | where TimeGenerated between (start_time .. end_time)
 | where DeviceName == HostInQuestion
-| where ProcessCommandLine contains "net user"
+| where ProcessCommandLine contains "net user" or ProcessCommandLine contains "net localgroup"
 | project Timestamp, ActionType, FileName, ProcessCommandLine, AccountName
 ```
 
