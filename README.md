@@ -4,7 +4,7 @@
 |---|---|
 | **Tool** | Microsoft Defender Advanced Hunting (KQL) |
 | **Trigger** | User reported repeated login prompts overnight |
-| **Time Window Investigated** | ~5.5 hours, overnight |
+| **Time Window Investigated** | 2-day search, narrowed to a ~6-hour overnight window |
 | **Outcome** | Confirmed compromise — remote access, C2 beaconing, 3 persistence mechanisms, privilege escalation |
 | **Skills Demonstrated** | KQL log analysis, process tree reconstruction, MITRE ATT&CK mapping, incident containment planning |
 
