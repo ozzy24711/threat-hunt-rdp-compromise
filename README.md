@@ -14,6 +14,8 @@ A user reported repeated login prompts on their workstation overnight. I investi
 
 ## Approach
 
+> Host: `npt-ws01` (lab environment). The compromised account name is replaced with the stand-in `svc_helpdesk` throughout.
+
 I worked the investigation in the order a real alert triage would follow: confirm the logon, identify the source, find what ran under that account, trace outbound communication, and find persistence.
 
 ## Investigation
@@ -24,29 +26,119 @@ Queried `DeviceLogonEvents` for the host and time window. Found a successful int
 **2. Identifying the source**
 Same event set, reading the remote IP field for that account's logon. Found an external public IP authenticating directly to the workstation — the first clear signal this wasn't user error.
 
+Query (Steps 1–2):
+
+```kql
+let start_time = datetime(2026-04-21T00:00:00.00Z);
+let end_time = datetime(2026-04-23T00:00:00.00Z);
+let HostInQuestion = "npt-ws01";
+DeviceLogonEvents
+| where TimeGenerated between (start_time .. end_time)
+| where DeviceName == HostInQuestion
+```
+
 **3. Finding the executed command**
 Queried `DeviceProcessEvents` filtered to the suspicious account. Found a `cmd.exe` line silently launching an executable out of `C:\Windows\Temp\` with output redirected to a randomly-named file — a pattern consistent with remote execution tooling (I looked this pattern up rather than recognizing it on sight).
+
+```kql
+let start_time = datetime(2026-04-21T00:00:00.00Z);
+let end_time = datetime(2026-04-23T00:00:00.00Z);
+let HostInQuestion = "npt-ws01";
+DeviceProcessEvents
+| where TimeGenerated between (start_time .. end_time)
+| where DeviceName == HostInQuestion
+| where AccountName == "svc_helpdesk"
+```
 
 **4. Tracing the parent process**
 Pivoted on that `cmd.exe` event and read `InitiatingProcessFileName`. The parent was the WMI provider host process, confirming the command was launched remotely via WMI rather than by a local user at the keyboard.
 
+Same query as Step 3, with `InitiatingProcessFileName` added to the projection to identify the parent process.
+
 **5. Finding command-and-control traffic**
 Queried `DeviceNetworkEvents` filtered to the compromised account, projecting the remote URL and initiating process. Found outbound traffic to a domain with no legitimate business purpose, from a non-Microsoft-signed process — consistent with C2 beaconing.
+
+```kql
+let start_time = datetime(2026-04-21T00:00:00.00Z);
+let end_time = datetime(2026-04-23T00:00:00.00Z);
+let HostInQuestion = "npt-ws01";
+DeviceNetworkEvents
+| where TimeGenerated between (start_time .. end_time)
+| where DeviceName == HostInQuestion
+| where InitiatingProcessAccountName == "svc_helpdesk"
+| project InitiatingProcessAccountDomain, InitiatingProcessFileName, RemoteUrl, ActionType
+```
 
 **6. Finding the dropped file**
 Queried `DeviceFileEvents` for the host and time window. Initial results were too noisy; I added a filter for non-empty SHA256 values to cut the result set down, then reviewed what remained for anything created in Temp under a name masquerading as a legitimate Windows process.
 
+```kql
+let start_time = datetime(2026-04-21T00:00:00.00Z);
+let end_time = datetime(2026-04-23T00:00:00.00Z);
+let HostInQuestion = "npt-ws01";
+DeviceFileEvents
+| where TimeGenerated between (start_time .. end_time)
+| where DeviceName == HostInQuestion
+| where isnotempty(SHA256)
+| project InitiatingProcessAccountDomain, InitiatingProcessFileName, SHA256, ActionType
+```
+
 **7. Finding registry persistence**
 Queried `DeviceRegistryEvents` filtered to Run-key writes. Found a Run-key value disguised as a legitimate update/health-check entry, pointing back at the dropped file in Temp.
+
+```kql
+let start_time = datetime(2026-04-22T02:00:00.00Z);
+let end_time = datetime(2026-04-22T08:00:00.00Z);
+let HostInQuestion = "npt-ws01";
+DeviceRegistryEvents
+| where TimeGenerated between (start_time .. end_time)
+| where DeviceName == HostInQuestion
+| where isnotempty(RegistryValueName)
+| where RegistryKey contains "run"
+| project RegistryKey, RegistryValueData, RegistryValueName, Timestamp, ActionType
+```
 
 **8. Finding scheduled-task persistence**
 Queried `DeviceProcessEvents` for command lines containing task-creation syntax. Found a `schtasks /create` command with a task name impersonating a well-known software updater, set to run daily.
 
+```kql
+let start_time = datetime(2026-04-22T02:00:00.00Z);
+let end_time = datetime(2026-04-22T08:00:00.00Z);
+let HostInQuestion = "npt-ws01";
+DeviceProcessEvents
+| where TimeGenerated between (start_time .. end_time)
+| where DeviceName == HostInQuestion
+| where ProcessCommandLine contains "tn"
+| project Timestamp, ActionType, FileName, ProcessCommandLine
+```
+
 **9. Finding service-based persistence**
 Same table, filtered for service-creation syntax instead. Found a single result: a service created with a name masquerading as a Windows health service, pointing at the same implant.
 
+```kql
+let start_time = datetime(2026-04-22T02:00:00.00Z);
+let end_time = datetime(2026-04-22T08:00:00.00Z);
+let HostInQuestion = "npt-ws01";
+DeviceProcessEvents
+| where TimeGenerated between (start_time .. end_time)
+| where DeviceName == HostInQuestion
+| where ProcessCommandLine contains "sc.exe create"
+| project Timestamp, ActionType, FileName, ProcessCommandLine
+```
+
 **10. Finding the backdoor account**
 Queried `DeviceProcessEvents` for `net user` commands. Found a new local account created and, in a correlated event seconds later, added to the local Administrators group — privilege escalation via a backdoor account.
+
+```kql
+let start_time = datetime(2026-04-22T02:00:00.00Z);
+let end_time = datetime(2026-04-22T08:00:00.00Z);
+let HostInQuestion = "npt-ws01";
+DeviceProcessEvents
+| where TimeGenerated between (start_time .. end_time)
+| where DeviceName == HostInQuestion
+| where ProcessCommandLine contains "net user"
+| project Timestamp, ActionType, FileName, ProcessCommandLine, AccountName
+```
 
 ## ATT&CK Mapping
 
