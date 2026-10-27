@@ -114,6 +114,7 @@ DeviceRegistryEvents
 ```
 
 **8. Finding scheduled-task persistence**
+
 Queried `DeviceProcessEvents` for command lines containing task-creation syntax. Found a `schtasks /create` command with a task name impersonating a well-known software updater, set to run daily.
 
 ```kql
