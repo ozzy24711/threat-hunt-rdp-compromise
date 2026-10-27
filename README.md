@@ -21,7 +21,7 @@ I worked the investigation in the order a real alert triage would follow: confir
 ## Investigation
 
 **1. Confirming the logon**
-Queried `DeviceLogonEvents` for the host and time window. Found a successful interactive/remote logon under an account that had no legitimate reason to be accessing that workstation — not the account of the person who reported the issue.
+Queried `DeviceLogonEvents` for the host and time window. Found a successful network logon (Type 3) from an external IP under an account that had no legitimate reason to be accessing that workstation — not the account of the person who reported the issue.
 
 **2. Identifying the source**
 Same event set, reading the remote IP field for that account's logon. Found an external public IP authenticating directly to the workstation — the first clear signal this wasn't user error.
