@@ -37,6 +37,7 @@ DeviceLogonEvents
 | where DeviceName == HostInQuestion
 | where ActionType == "LogonSuccess"
 | project Timestamp, AccountName, LogonType, RemoteIP, ActionType
+![Network logon from external IP](Screenshot%202026-10-27%20040334.png)
 ```
 
 **3. Finding the executed command**
