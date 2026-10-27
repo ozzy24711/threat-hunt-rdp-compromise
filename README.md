@@ -21,9 +21,11 @@ I worked the investigation in the order a real alert triage would follow: confir
 ## Investigation
 
 **1. Confirming the logon**
+
 Queried `DeviceLogonEvents` for the host and time window. Found a successful network logon (Type 3) from an external IP under an account that had no legitimate reason to be accessing that workstation — not the account of the person who reported the issue.
 
 **2. Identifying the source**
+
 Same event set, reading the remote IP field for that account's logon. Found an external public IP authenticating directly to the workstation — the first clear signal this wasn't user error.
 
 Query (Steps 1–2):
@@ -41,6 +43,7 @@ DeviceLogonEvents
 ![Network logon from external IP](Screenshot%202026-10-27%20040334.png)
 
 **3. Finding the executed command**
+
 Queried `DeviceProcessEvents` filtered to the suspicious account. Found a `cmd.exe` line silently launching an executable out of `C:\Windows\Temp\` with output redirected to a randomly-named file — a pattern consistent with remote execution tooling (I looked this pattern up rather than recognizing it on sight).
 
 ```kql
@@ -54,11 +57,13 @@ DeviceProcessEvents
 ```
 
 **4. Tracing the parent process**
+
 Pivoted on that `cmd.exe` event and read `InitiatingProcessFileName`. The parent was the WMI provider host process, confirming the command was launched remotely via WMI rather than by a local user at the keyboard.
 
 Same as Step 3, with `InitiatingProcessFileName` added to the projection.
 
 **5. Finding command-and-control traffic**
+
 Queried `DeviceNetworkEvents` filtered to the compromised account, projecting the remote URL and initiating process. Found outbound traffic to a domain with no legitimate business purpose, from a non-Microsoft-signed process — consistent with C2 beaconing.
 
 ```kql
@@ -75,6 +80,7 @@ DeviceNetworkEvents
 Results were manually reviewed to exclude Microsoft-signed processes and known-legitimate domains (e.g. `*.microsoft.com`, `*.windows.com`).
 
 **6. Finding the dropped file**
+
 Queried `DeviceFileEvents` for the host and time window. Initial results were too noisy; I added filters for non-empty SHA256 values and a Temp folder path to cut the result set down, then reviewed what remained for anything under a name masquerading as a legitimate Windows process.
 
 ```kql
@@ -92,6 +98,7 @@ DeviceFileEvents
 > **Time window note:** Steps 1–6 searched a two-day window to establish the timeline. Once the malicious activity was located, Steps 7–10 were narrowed to the ~6-hour overnight window (2026-04-22 02:00–08:00 UTC) where it occurred, to reduce noise.
 
 **7. Finding registry persistence**
+
 Queried `DeviceRegistryEvents` filtered to Run-key writes. Found a Run-key value disguised as a legitimate update/health-check entry, pointing back at the dropped file in Temp.
 
 ```kql
@@ -121,6 +128,7 @@ DeviceProcessEvents
 ```
 
 **9. Finding service-based persistence**
+
 Same table, filtered for service-creation syntax instead. Found a single result: a service created with a name masquerading as a Windows health service, pointing at the same implant.
 
 ```kql
@@ -135,6 +143,7 @@ DeviceProcessEvents
 ```
 
 **10. Finding the backdoor account**
+
 Queried `DeviceProcessEvents` for `net user` and `net localgroup` commands. Found a new local account created and, in a correlated event seconds later, added to the local Administrators group — privilege escalation via a backdoor account.
 
 ```kql
