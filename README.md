@@ -39,6 +39,7 @@ DeviceLogonEvents
 | project Timestamp, AccountName, LogonType, RemoteIP, ActionType
 ```
 ![Network logon from external IP](Screenshot%202026-10-27%20040334.png)
+
 **3. Finding the executed command**
 Queried `DeviceProcessEvents` filtered to the suspicious account. Found a `cmd.exe` line silently launching an executable out of `C:\Windows\Temp\` with output redirected to a randomly-named file — a pattern consistent with remote execution tooling (I looked this pattern up rather than recognizing it on sight).
 
