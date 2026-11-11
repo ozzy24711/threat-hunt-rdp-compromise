@@ -1,20 +1,26 @@
-# Threat Hunt: Overnight RDP Alert Investigation
+# Threat Hunt: Remote Network Logon, WMI Execution, and Persistence
 
 | | |
 |---|---|
 | **Tool** | Microsoft Defender Advanced Hunting (KQL) |
-| **Trigger** | User reported repeated login prompts overnight |
+| **Trigger** | User reported repeated login prompts overnight (escalated as a suspected RDP compromise) |
 | **Time Window Investigated** | 2-day search, narrowed to a ~6-hour overnight window |
-| **Outcome** | Confirmed compromise — remote access, C2 beaconing, 3 persistence mechanisms, privilege escalation |
-| **Skills Demonstrated** | KQL log analysis, process tree reconstruction, MITRE ATT&CK mapping, incident containment planning |
+| **Outcome** | Confirmed compromise — remote network logon with valid credentials, WMI remote execution, C2 beaconing, 3 persistence mechanisms, privilege escalation |
+| **Skills Demonstrated** | KQL log analysis, process tree reconstruction, MITRE ATT&CK mapping, detection engineering, incident containment planning |
 
 ## Scenario
 
 A user reported repeated login prompts on their workstation overnight. I investigated whether this represented a real compromise or a false alarm, using a guided threat-hunting exercise as training (completed via CyberRange).
 
+### Why this isn't titled "RDP"
+
+The alert came in as a suspected RDP compromise, and that's how I started the hunt. The evidence didn't support it. An RDP session logs as `LogonType` **RemoteInteractive (Type 10)**. What I found was a **Network (Type 3)** logon, followed by commands launched by the WMI provider host (`WmiPrvSE.exe`). That points to remote execution over the network with valid credentials, not someone sitting in an interactive RDP session. I named the write-up after what the logs showed, not what the ticket assumed.
+
 ## Approach
 
 > Host: `npt-ws01` (lab environment). The compromised account name is replaced with the stand-in `svc_helpdesk` throughout.
+
+> **Time column:** every query filters and displays `TimeGenerated`. These Defender tables also carry `Timestamp`. `Timestamp` is when Defender recorded the event on the device; `TimeGenerated` is when the record landed in the Log Analytics workspace, so it can trail by a few seconds. I use one column throughout so the filter and the output always agree.
 
 I worked the investigation in the order a real alert triage would follow: confirm the logon, identify the source, find what ran under that account, trace outbound communication, and find persistence.
 
@@ -38,7 +44,7 @@ DeviceLogonEvents
 | where TimeGenerated between (start_time .. end_time)
 | where DeviceName == HostInQuestion
 | where ActionType == "LogonSuccess"
-| project Timestamp, AccountName, LogonType, RemoteIP, ActionType
+| project TimeGenerated, AccountName, LogonType, RemoteIP, ActionType
 ```
 ![Network logon from external IP](Screenshot%202026-10-27%20040334.png)
 
@@ -56,13 +62,14 @@ DeviceProcessEvents
 | where TimeGenerated between (start_time .. end_time)
 | where DeviceName == HostInQuestion
 | where AccountName == "svc_helpdesk"
+| project TimeGenerated, AccountName, FileName, FolderPath, ProcessCommandLine, InitiatingProcessFileName
 ```
 
 **4. Tracing the parent process**
 
 Pivoted on that `cmd.exe` event and read `InitiatingProcessFileName`. The parent was the WMI provider host process, confirming the command was launched remotely via WMI rather than by a local user at the keyboard.
 
-Same as Step 3, with `InitiatingProcessFileName` added to the projection.
+Same query as Step 3; `InitiatingProcessFileName` is in the projection for this pivot.
 
 **5. Finding command-and-control traffic**
 
@@ -76,7 +83,7 @@ DeviceNetworkEvents
 | where TimeGenerated between (start_time .. end_time)
 | where DeviceName == HostInQuestion
 | where InitiatingProcessAccountName == "svc_helpdesk"
-| project InitiatingProcessAccountDomain, InitiatingProcessFileName, RemoteUrl, ActionType
+| project TimeGenerated, InitiatingProcessAccountDomain, InitiatingProcessFileName, RemoteUrl, ActionType
 ```
 
 Results were manually reviewed to exclude Microsoft-signed processes and known-legitimate domains (e.g. `*.microsoft.com`, `*.windows.com`).
@@ -94,7 +101,7 @@ DeviceFileEvents
 | where DeviceName == HostInQuestion
 | where isnotempty(SHA256)
 | where FolderPath contains "Temp"
-| project InitiatingProcessAccountDomain, InitiatingProcessFileName, FolderPath, SHA256, ActionType
+| project TimeGenerated, InitiatingProcessAccountDomain, InitiatingProcessFileName, FolderPath, SHA256, ActionType
 ```
 
 > **Time window note:** Steps 1–6 searched a two-day window to establish the timeline. Once the malicious activity was located, Steps 7–10 were narrowed to the ~6-hour overnight window (2026-04-22 02:00–08:00 UTC) where it occurred, to reduce noise.
@@ -112,7 +119,7 @@ DeviceRegistryEvents
 | where DeviceName == HostInQuestion
 | where isnotempty(RegistryValueName)
 | where RegistryKey contains "run"
-| project RegistryKey, RegistryValueData, RegistryValueName, Timestamp, ActionType
+| project TimeGenerated, RegistryKey, RegistryValueData, RegistryValueName, ActionType
 ```
 
 **8. Finding scheduled-task persistence**
@@ -127,7 +134,7 @@ DeviceProcessEvents
 | where TimeGenerated between (start_time .. end_time)
 | where DeviceName == HostInQuestion
 | where ProcessCommandLine contains "schtasks" and ProcessCommandLine contains "/create"
-| project Timestamp, ActionType, FileName, ProcessCommandLine
+| project TimeGenerated, ActionType, FileName, ProcessCommandLine
 ```
 
 **9. Finding service-based persistence**
@@ -142,7 +149,7 @@ DeviceProcessEvents
 | where TimeGenerated between (start_time .. end_time)
 | where DeviceName == HostInQuestion
 | where ProcessCommandLine contains "sc.exe create"
-| project Timestamp, ActionType, FileName, ProcessCommandLine
+| project TimeGenerated, ActionType, FileName, ProcessCommandLine
 ```
 
 **10. Finding the backdoor account**
@@ -157,8 +164,30 @@ DeviceProcessEvents
 | where TimeGenerated between (start_time .. end_time)
 | where DeviceName == HostInQuestion
 | where ProcessCommandLine contains "net user" or ProcessCommandLine contains "net localgroup"
-| project Timestamp, ActionType, FileName, ProcessCommandLine, AccountName
+| project TimeGenerated, ActionType, FileName, ProcessCommandLine, AccountName
 ```
+
+## Detection Rule: Execution from a Temp Folder
+
+The hunt found this attacker after persistence was already in place. This rule would have fired at Step 3, when the payload first ran out of `C:\Windows\Temp\`, before the Run key, scheduled task, service, and backdoor account existed.
+
+```kql
+// Alert: executable launched from a Temp folder by a shell or by WMI
+DeviceProcessEvents
+| where TimeGenerated > ago(1h)
+| where FolderPath contains @"\Temp\"
+| where FileName endswith ".exe"
+| where InitiatingProcessFileName in~ ("cmd.exe", "powershell.exe", "wmiprvse.exe")
+    or InitiatingProcessParentFileName =~ "wmiprvse.exe"
+| where ProcessVersionInfoCompanyName !has "Microsoft"
+| project TimeGenerated, DeviceName, AccountName, FileName, FolderPath, ProcessCommandLine,
+          InitiatingProcessFileName, InitiatingProcessParentFileName, SHA256
+```
+
+- **What it catches here:** `WmiPrvSE.exe` → `cmd.exe` → non-Microsoft executable in `C:\Windows\Temp\` (Steps 3–4).
+- **Schedule:** every hour, looking back one hour, as a Sentinel analytics rule.
+- **Expected false positives:** software installers and updaters that unpack to Temp. Tune by excluding known-good `SHA256` values or signers after a week of baseline, not by dropping the Temp condition.
+- **Note:** as a Defender XDR custom detection instead of a Sentinel rule, the output must also include `Timestamp`, `DeviceId`, and `ReportId`.
 
 ## ATT&CK Mapping
 
@@ -183,4 +212,4 @@ DeviceProcessEvents
 
 I started with the logon table because the original report was about login prompts happening overnight — that's the literal event the user experienced, so it's the natural place to confirm what actually happened. Two things stood out once I filtered to that account: the logon was remote, and it happened outside normal work hours. Neither one alone is definitive, but remote access at that time of night is a strong combined signal worth flagging automatically.
 
-Going forward, I'd want MFA enforced on remote/interactive logons if it isn't already, plus an alert on execution from the Temp folder — that's an unusual place for legitimate software to run from, and it would have caught this earlier in the chain, closer to initial access instead of after persistence was already in place.
+Going forward, I'd want MFA enforced on remote/interactive logons if it isn't already, plus an alert on execution from the Temp folder (written out above under [Detection Rule](#detection-rule-execution-from-a-temp-folder)). Temp is an unusual place for legitimate software to run from, and that rule would have caught this earlier in the chain, closer to initial access instead of after persistence was already in place.
